@@ -66,6 +66,8 @@ const MODES = {
 const sessions = new Map();
 const replyKeyboardRemovedUsers = new Set();
 const pendingPayments = new Map();
+const usernameToId = new Map();
+const processedGroupSignals = new Set();
 let botUsernameCache = (process.env.TELEGRAM_BOT_USERNAME || "").trim();
 let prismaTelegramSchemaReady = true;
 
@@ -98,6 +100,7 @@ async function fallbackUpsertUser(userId, username = null) {
       subscriptionTil: null,
       onboardingCompleted: false,
       trialUsed: false,
+      groups: {},
       createdAt: new Date().toISOString(),
     };
   } else if (username) {
@@ -109,6 +112,9 @@ async function fallbackUpsertUser(userId, username = null) {
   }
   if (typeof state.users[tg].trialUsed !== "boolean") {
     state.users[tg].trialUsed = false;
+  }
+  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
+    state.users[tg].groups = {};
   }
   await writeStateFile(state);
   return state.users[tg];
@@ -124,6 +130,7 @@ async function fallbackSetSubscription(userId, until) {
       subscriptionTil: null,
       onboardingCompleted: false,
       trialUsed: false,
+      groups: {},
       createdAt: new Date().toISOString(),
     };
   }
@@ -146,6 +153,7 @@ async function markTrialUsed(userId, username = null) {
       subscriptionTil: null,
       onboardingCompleted: false,
       trialUsed: true,
+      groups: {},
       createdAt: new Date().toISOString(),
     };
   } else {
@@ -153,6 +161,83 @@ async function markTrialUsed(userId, username = null) {
     state.users[tg].trialUsed = true;
   }
   await writeStateFile(state);
+}
+
+async function fallbackUpsertGroupForUser(userId, chat) {
+  const tg = String(userId);
+  const state = await readStateFile();
+  if (!state.users[tg]) {
+    state.users[tg] = {
+      telegramId: tg,
+      username: null,
+      subscriptionTil: null,
+      onboardingCompleted: false,
+      trialUsed: false,
+      groups: {},
+      createdAt: new Date().toISOString(),
+    };
+  }
+  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
+    state.users[tg].groups = {};
+  }
+
+  const groupId = String(chat?.id);
+  const prev = state.users[tg].groups[groupId] || {};
+  state.users[tg].groups[groupId] = {
+    id: groupId,
+    title: chat?.title || chat?.username || "Группа",
+    type: chat?.type || "group",
+    enabled: typeof prev.enabled === "boolean" ? prev.enabled : true,
+    lastSeenAt: new Date().toISOString(),
+  };
+
+  await writeStateFile(state);
+  return state.users[tg].groups[groupId];
+}
+
+async function getUserGroups(userId) {
+  const user = await fallbackUpsertUser(userId, null);
+  const groupsObj = user?.groups && typeof user.groups === "object" ? user.groups : {};
+  return Object.values(groupsObj).sort((a, b) => {
+    const ta = new Date(a?.lastSeenAt || 0).getTime();
+    const tb = new Date(b?.lastSeenAt || 0).getTime();
+    return tb - ta;
+  });
+}
+
+async function setGroupEnabledForUser(userId, groupId, enabled) {
+  const tg = String(userId);
+  const gid = String(groupId);
+  const state = await readStateFile();
+  if (!state.users[tg]) {
+    state.users[tg] = {
+      telegramId: tg,
+      username: null,
+      subscriptionTil: null,
+      onboardingCompleted: false,
+      trialUsed: false,
+      groups: {},
+      createdAt: new Date().toISOString(),
+    };
+  }
+  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
+    state.users[tg].groups = {};
+  }
+  const prev = state.users[tg].groups[gid] || { id: gid, title: "Группа", type: "group" };
+  state.users[tg].groups[gid] = {
+    ...prev,
+    enabled: Boolean(enabled),
+    lastSeenAt: new Date().toISOString(),
+  };
+  await writeStateFile(state);
+  return state.users[tg].groups[gid];
+}
+
+async function isGroupEnabledForUser(userId, groupId) {
+  const groups = await getUserGroups(userId);
+  const row = groups.find((g) => String(g.id) === String(groupId));
+  if (!row) return true;
+  return Boolean(row.enabled);
 }
 
 async function getOnboardingCompleted(userId, username = null) {
@@ -210,6 +295,44 @@ function setSession(userId, patch) {
   Object.assign(s, patch);
   sessions.set(String(userId), s);
   return s;
+}
+
+function cacheUsername(from) {
+  try {
+    const uname = from?.username ? String(from.username).toLowerCase() : null;
+    const uid = from?.id;
+    if (!uname || !uid) return;
+    usernameToId.set(uname, Number(uid));
+  } catch {}
+}
+
+function extractMentionedUserId(message, text) {
+  const raw = String(text || "");
+  try {
+    const entities = message?.entities || message?.caption_entities || [];
+    for (const ent of entities) {
+      if (ent?.type === "text_mention" && ent?.user?.id) {
+        return Number(ent.user.id);
+      }
+      if (
+        ent?.type === "mention" &&
+        typeof ent?.offset === "number" &&
+        typeof ent?.length === "number"
+      ) {
+        const chunk = raw.slice(ent.offset, ent.offset + ent.length);
+        const uname = chunk.startsWith("@") ? chunk.slice(1).toLowerCase() : chunk.toLowerCase();
+        const id = usernameToId.get(uname);
+        if (id) return Number(id);
+      }
+    }
+  } catch {}
+
+  const rx = raw.match(/(^|\s)@([a-zA-Z0-9_]{3,32})\b/);
+  if (rx?.[2]) {
+    const id = usernameToId.get(String(rx[2]).toLowerCase());
+    if (id) return Number(id);
+  }
+  return null;
 }
 
 async function ensureUserAndHydrateSession(userId, username = null) {
@@ -364,6 +487,12 @@ function isPremium(s) {
   return dt > new Date();
 }
 
+function isGroupChatId(chatId) {
+  if (typeof chatId === "number") return chatId < 0;
+  if (typeof chatId === "string") return chatId.startsWith("-");
+  return false;
+}
+
 function cancelPending(userId) {
   const s = getSession(userId);
   if (s.pendingTimer) {
@@ -405,10 +534,14 @@ async function ensureWebhook() {
 }
 
 async function sendMessage(chatId, text, extra = {}) {
+  // Бот ничего не пишет в группы/каналы.
+  if (isGroupChatId(chatId)) return null;
   return tg("sendMessage", { chat_id: chatId, text, ...extra });
 }
 
 async function editMessageText(chatId, messageId, text, extra = {}) {
+  // Бот ничего не редактирует/не пишет в группы/каналы.
+  if (isGroupChatId(chatId)) return null;
   try {
     return await tg("editMessageText", {
       chat_id: chatId,
@@ -597,6 +730,11 @@ function buildHelpText() {
     "• /profile - профиль (то же, что /status)\n" +
     "• /help - эта справка\n" +
     "• /onboarding - пройти онбординг заново\n\n" +
+    "Если бот не отвечает:\n" +
+    "1) Нажми /start ещё раз\n" +
+    "2) Подожди 10-20 секунд и отправь сообщение повторно\n" +
+    "3) Перезапусти Telegram и открой чат с ботом заново\n" +
+    "4) Если проблема осталась — напиши в поддержку @assistly_support_bot и приложи скрин\n\n" +
     "Основное управление - через кнопки в меню."
   );
 }
@@ -745,6 +883,43 @@ async function sendDraftWithDelay({ chatId, userId, incomingText }) {
   setSession(userId, { pendingTimer: timer });
 }
 
+async function notifyGroupQuestionToUser({ targetUserId, sourceMsg, incomingText }) {
+  const key = `${sourceMsg?.chat?.id}:${sourceMsg?.message_id}:${targetUserId}`;
+  if (processedGroupSignals.has(key)) return;
+  processedGroupSignals.add(key);
+
+  const groupTitle = sourceMsg?.chat?.title || sourceMsg?.chat?.username || "Группа";
+  const fromName =
+    [sourceMsg?.from?.first_name, sourceMsg?.from?.last_name].filter(Boolean).join(" ") ||
+    sourceMsg?.from?.username ||
+    "Участник";
+
+  const body =
+    "💬 <b>В группе тебе задали вопрос</b>\n\n" +
+    `👥 <b>${escapeHtml(groupTitle)}</b>\n` +
+    `👤 От: <b>${escapeHtml(fromName)}</b>\n\n` +
+    `Сообщение:\n<code>${escapeHtml(incomingText)}</code>\n\n` +
+    "Подготовить ответ на это сообщение?";
+
+  setSession(targetUserId, {
+    lastIncomingText: incomingText,
+    lastSource: "group",
+    lastGroupChatId: String(sourceMsg?.chat?.id || ""),
+    awaitingInput: false,
+  });
+
+  await sendMessage(targetUserId, body, {
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "✅ Подготовить ответ", callback_data: "group_prepare_reply" }],
+        [{ text: "🚫 Не надо", callback_data: "group_no_need" }],
+        [{ text: "🙈 Игнорировать", callback_data: "group_ignore" }],
+      ],
+    },
+  });
+}
+
 async function renderHome(chatId, userId, messageId = null) {
   const username = await resolveBotUsername();
   const payload = {
@@ -780,19 +955,40 @@ async function renderHelp(chatId, messageId) {
   });
 }
 
-async function renderConnect(chatId, messageId) {
-  const text =
+async function renderConnect(chatId, userId, messageId) {
+  const groups = await getUserGroups(userId);
+  let text =
     "👥 <b>Группы (подсказки)</b>\n\n" +
     "Бот не отправляет сообщения в группы от твоего имени.\n" +
-    "Он подготавливает черновики в личке, а ты отправляешь их сам.\n\n" +
-    "Чтобы использовать в группах:\n" +
-    "1) Добавь бота в группу\n" +
-    "2) Пиши в личку боту и готовь ответ\n" +
-    "3) Копируй и отправляй вручную";
+    "Он подготавливает черновики в личке, а ты отправляешь их сам.\n\n";
+
+  if (!groups.length) {
+    text +=
+      "Пока нет групп в списке.\n\n" +
+      "Что сделать:\n" +
+      "1) Добавь бота в нужную группу\n" +
+      "2) Напиши в группе хотя бы одно сообщение\n" +
+      "3) Вернись сюда и нажми «Обновить»";
+  } else {
+    text += "Выбери группу ниже, чтобы включить или выключить подсказки:";
+  }
+
+  const keyboard = [];
+  for (const g of groups) {
+    const mark = g.enabled ? "✅" : "❌";
+    keyboard.push([
+      {
+        text: `${mark} ${g.title || "Группа"}`,
+        callback_data: `group_toggle:${g.id}`,
+      },
+    ]);
+  }
+  keyboard.push([{ text: "🔄 Обновить", callback_data: "connect_refresh" }]);
+  keyboard.push([{ text: "⬅ Назад", callback_data: "menu_settings" }]);
 
   return editMessageText(chatId, messageId, text, {
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [[{ text: "⬅ Назад", callback_data: "menu_home" }]] },
+    reply_markup: { inline_keyboard: keyboard },
   });
 }
 
@@ -862,6 +1058,10 @@ async function handleCommand(message, text) {
   const chatId = message.chat.id;
   const userId = message.from?.id;
   if (!userId) return;
+
+  // Команды обрабатываем только в личке.
+  if (message.chat?.type !== "private") return;
+
   await ensureUserAndHydrateSession(userId, message.from?.username || null);
 
   const cmd = text.split(" ")[0].toLowerCase();
@@ -904,6 +1104,34 @@ async function handleCallback(query) {
   await ensureUserAndHydrateSession(userId, query.from?.username || null);
 
   await answerCallbackQuery(query.id);
+
+  if (data === "group_prepare_reply") {
+    const s = getSession(userId);
+    if (!s.lastIncomingText) {
+      return editMessageText(
+        chatId,
+        messageId,
+        "Не нашёл исходное сообщение. Пришли текст вручную через «Подготовить ответ».",
+        {
+          reply_markup: { inline_keyboard: [[{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }]] },
+        }
+      );
+    }
+    return sendDraftWithDelay({ chatId, userId, incomingText: s.lastIncomingText });
+  }
+
+  if (data === "group_no_need") {
+    return editMessageText(chatId, messageId, "Ок, не готовлю ответ на это сообщение.", {
+      reply_markup: { inline_keyboard: [[{ text: "🏠 Главное меню", callback_data: "menu_home" }]] },
+    });
+  }
+
+  if (data === "group_ignore") {
+    setSession(userId, { lastIncomingText: "" });
+    return editMessageText(chatId, messageId, "Принято. Игнорирую это сообщение.", {
+      reply_markup: { inline_keyboard: [[{ text: "🏠 Главное меню", callback_data: "menu_home" }]] },
+    });
+  }
 
   if (data === "onb_next_2") return renderOnboarding(chatId, userId, 2, messageId);
   if (data === "onb_next_3") return renderOnboarding(chatId, userId, 3, messageId);
@@ -998,7 +1226,16 @@ async function handleCallback(query) {
 
   if (data === "menu_settings") return renderSettings(chatId, userId, messageId);
   if (data === "help_how") return renderHelp(chatId, messageId);
-  if (data === "connect_chat") return renderConnect(chatId, messageId);
+  if (data === "connect_chat" || data === "connect_refresh") return renderConnect(chatId, userId, messageId);
+  if (data.startsWith("group_toggle:")) {
+    const groupId = data.replace("group_toggle:", "").trim();
+    const groups = await getUserGroups(userId);
+    const row = groups.find((g) => String(g.id) === String(groupId));
+    const nextEnabled = row ? !Boolean(row.enabled) : true;
+    await setGroupEnabledForUser(userId, groupId, nextEnabled);
+    await answerCallbackQuery(query.id, { text: nextEnabled ? "✅ Включено" : "❌ Выключено" });
+    return renderConnect(chatId, userId, messageId);
+  }
   if (data === "menu_sub") {
     return editMessageText(chatId, messageId, buildSubText(userId), {
       parse_mode: "HTML",
@@ -1199,10 +1436,57 @@ async function handleMessage(message) {
   const chatId = message.chat?.id;
   const userId = message.from?.id;
   const text = message.text?.trim();
-  if (!chatId || !userId || !text) return;
+  if (!chatId || !userId) return;
+
+  // ============================
+  // GROUP SILENT ASSIST
+  // Ничего не пишем в группу, только сигналим в личку адресату.
+  // ============================
+  if (message.chat?.type === "group" || message.chat?.type === "supergroup") {
+    const incomingText = String(message.text || message.caption || "").trim();
+    if (!incomingText) return;
+
+    cacheUsername(message.from);
+    cacheUsername(message.reply_to_message?.from);
+
+    // Сохраняем группу для автора сообщения (чтобы видел у себя список групп).
+    await fallbackUpsertGroupForUser(message.from.id, message.chat);
+
+    let targetUserId = null;
+    if (message.reply_to_message?.from?.id && !message.reply_to_message?.from?.is_bot) {
+      targetUserId = Number(message.reply_to_message.from.id);
+    }
+    if (!targetUserId) {
+      targetUserId = extractMentionedUserId(message, incomingText);
+    }
+    if (!targetUserId) return;
+    if (Number(targetUserId) === Number(message.from?.id)) return;
+
+    await ensureUserAndHydrateSession(targetUserId, message.reply_to_message?.from?.username || null);
+    await fallbackUpsertGroupForUser(targetUserId, message.chat);
+
+    const enabledForTarget = await isGroupEnabledForUser(targetUserId, message.chat.id);
+    if (!enabledForTarget) return;
+
+    const targetState = getSession(targetUserId);
+
+    // По продуктовой логике — фича для подписки/пробной.
+    if (!isPremium(targetState)) return;
+
+    await notifyGroupQuestionToUser({
+      targetUserId,
+      sourceMsg: message,
+      incomingText,
+    });
+    return;
+  }
+
+  if (!text) return;
   await ensureUserAndHydrateSession(userId, message.from?.username || null);
 
-  await ensureReplyKeyboardRemoved(chatId, userId);
+  if (message.chat?.type === "private") {
+    await ensureReplyKeyboardRemoved(chatId, userId);
+  }
 
   if (text.startsWith("/")) {
     await handleCommand(message, text);

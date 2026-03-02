@@ -1,12 +1,21 @@
 {
   "users": {
+    "670824173": {
+      "telegramId": "670824173",
+      "username": "ran9all",
+      "subscriptionTil": "2026-03-05T13:37:34.288Z",
+      "onboardingCompleted": true,
+      "trialUsed": true,
+      "createdAt": "2026-03-02T13:37:09.995Z"
+    },
     "1441173568": {
       "telegramId": "1441173568",
       "username": "danilyb",
       "subscriptionTil": "2026-03-13T19:43:54.858Z",
       "createdAt": "2026-02-28T19:43:46.141Z",
       "onboardingCompleted": true,
-      "trialUsed": false
+      "trialUsed": false,
+      "groups": {}
     }
   }
 }
