@@ -389,6 +389,7 @@ function getSession(userId) {
       delaySec: 10,
       awaitingInput: false,
       awaitingTransformInput: false,
+      pendingClarifyText: "",
       lastIncomingText: "",
       lastDraft: "",
       lastTransformInput: "",
@@ -997,46 +998,174 @@ function draftResultKeyboard(userId) {
   };
 }
 
+function assessDraftInput(text = "") {
+  const src = String(text || "").trim();
+  if (!src) {
+    return {
+      ready: false,
+      reason: "empty",
+      prompt:
+        "Пришли сообщение собеседника целиком или добавь контекст: что нужно ответить, какие условия и сроки важны.",
+    };
+  }
+
+  const normalized = src.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+  const words = normalized ? normalized.split(" ").filter(Boolean) : [];
+  const chars = src.length;
+  const genericOnly = /^(ок|ага|понял|поняла|ясно|норм|спасибо|привет|добрый день|да|нет)$/i.test(normalized);
+
+  if (genericOnly) {
+    return {
+      ready: false,
+      reason: "generic",
+      prompt:
+        "Текст слишком общий. Добавь, пожалуйста, что именно нужно ответить: цель, условия, сроки/сумма или желаемый тон.",
+    };
+  }
+
+  if (chars < 8 || words.length < 2) {
+    return {
+      ready: false,
+      reason: "too_short",
+      prompt:
+        "Слишком мало данных для точного ответа. Добавь 1-2 детали: о чём вопрос, что важно по условиям, и какой результат нужен.",
+    };
+  }
+
+  const hasQuestion = /[?]/.test(src);
+  const hasIntentWords =
+    /\b(нужно|надо|сделать|ответить|подскажи|помоги|как|когда|почему|где|что|сколько|услов|срок|смет|цена|оплат|договор|результат)\b/i.test(
+      src
+    );
+
+  if (!hasQuestion && !hasIntentWords && words.length < 5) {
+    return {
+      ready: false,
+      reason: "unclear",
+      prompt:
+        "Не хватает контекста. Добавь, пожалуйста, что именно хочет собеседник и какие рамки важны (срок, сумма, условия).",
+    };
+  }
+
+  return { ready: true, reason: "ok", prompt: "" };
+}
+
+async function requestDraftClarification({ chatId, userId, promptText }) {
+  setSession(userId, { awaitingInput: true });
+  return sendMessage(
+    chatId,
+    "🧩 <b>Чтобы дать точный вариант, нужно чуть больше данных</b>\n\n" +
+      `${escapeHtml(promptText)}\n\n` +
+      "Можно сразу дописать детали одним сообщением или сгенерировать ответ как есть.",
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "⚡ Сгенерировать как есть", callback_data: "quick_force_generate" }],
+          [{ text: "✍️ Добавить детали", callback_data: "quick_add_details" }],
+          [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
+        ],
+      },
+    }
+  );
+}
+
+async function handleDraftRequest({ chatId, userId, incomingText, force = false }) {
+  const src = String(incomingText || "").trim();
+  const check = assessDraftInput(src);
+
+  setSession(userId, { lastIncomingText: src });
+
+  if (!force && !check.ready) {
+    setSession(userId, { pendingClarifyText: src });
+    await requestDraftClarification({ chatId, userId, promptText: check.prompt });
+    return;
+  }
+
+  setSession(userId, { pendingClarifyText: "", awaitingInput: false });
+  await sendDraftWithDelay({ chatId, userId, incomingText: src });
+}
+
 async function createDraft(incomingText, mode) {
   const safeMode = MODES[mode] ? mode : "normal";
   const modePrompt = MODES[safeMode].system;
+  const src = String(incomingText || "").trim();
 
-  if (!openai) {
-    const fallback = {
-      normal: "Понял. Спасибо за сообщение, сейчас уточню детали и вернусь с ответом.",
-      short: "Понял, уточню детали и отвечу.",
+  const localFallbackDraft = (text, draftMode) => {
+    const t = String(text || "").trim();
+    if (!t) return "Понял. Что именно нужно ответить?";
+
+    const looksLikeQuestion = /\?|как\b|почему\b|когда\b|где\b|что\b|сколько\b/i.test(t);
+    const addOn = looksLikeQuestion ? " Если уточнишь пару деталей, отвечу точнее." : "";
+
+    const modeFallback = {
+      normal: "Понял. Сейчас подумаю и вернусь с ответом.",
+      short: "Понял, отвечу чуть позже.",
       polite: "Благодарю за сообщение. Уточните, пожалуйста, детали, чтобы я ответил точнее.",
       tothepoint: "Принято. Нужны сроки и конкретика для точного ответа.",
       refuse: "Спасибо за предложение, но сейчас не смогу подключиться.",
-      busy: "Сейчас занят, отвечу чуть позже.",
+      busy: "Сейчас занят, вернусь с ответом чуть позже.",
     };
-    return fallback[safeMode] || fallback.normal;
+
+    return (modeFallback[draftMode] || modeFallback.normal) + addOn;
+  };
+
+  if (!openai) {
+    return localFallbackDraft(src, safeMode);
   }
 
-  const completion = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0.5,
-    max_tokens: 180,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Ты личный помощник по переписке. Генерируешь один готовый текст ответа, который пользователь скопирует и отправит сам. Без кавычек, без заголовков, без пояснений.",
-      },
-      {
-        role: "system",
-        content: modePrompt,
-      },
-      {
-        role: "user",
-        content: `Сообщение собеседника:\n${incomingText}`,
-      },
-    ],
-  });
+  const withTimeout = async (promise, ms) => {
+    let timer = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`openai timeout ${ms}ms`)), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
-  const text = completion.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("empty model response");
-  return text;
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const completion = await withTimeout(
+        openai.chat.completions.create({
+          model: OPENAI_MODEL,
+          temperature: 0.5,
+          max_tokens: 180,
+          messages: [
+            {
+              role: "system",
+              content:
+                "Ты личный помощник по переписке. Генерируешь один готовый текст ответа, который пользователь скопирует и отправит сам. Без кавычек, без заголовков, без пояснений.",
+            },
+            {
+              role: "system",
+              content: modePrompt,
+            },
+            {
+              role: "user",
+              content: `Сообщение собеседника:\n${src}`,
+            },
+          ],
+        }),
+        15000
+      );
+
+      const text = completion.choices?.[0]?.message?.content?.trim();
+      if (text) return text;
+      lastError = new Error("empty model response");
+    } catch (err) {
+      lastError = err;
+      if (attempt < 2) continue;
+    }
+  }
+
+  console.error("createDraft fallback:", lastError?.message || lastError);
+  return localFallbackDraft(src, safeMode);
 }
 
 function sanitizeParaphraseOutput(text = "") {
@@ -1285,9 +1414,16 @@ async function sendDraftWithDelay({ chatId, userId, incomingText }) {
       );
     } catch (err) {
       console.error("draft generation error:", err?.message || err);
-      await sendMessage(chatId, "Не получилось подготовить ответ. Попробуй еще раз.", {
-        reply_markup: { inline_keyboard: [[{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }]] },
-      });
+      const backupDraft = "Принято. Уточню детали и вернусь с ответом.";
+      setSession(userId, { lastDraft: backupDraft });
+      await sendMessage(
+        chatId,
+        "📝 <b>Готовый ответ:</b>\n\n" + `${escapeHtml(backupDraft)}\n\n` + "<i>(Скопируй и отправь собеседнику)</i>",
+        {
+          parse_mode: "HTML",
+          reply_markup: draftResultKeyboard(userId),
+        }
+      );
       setSession(userId, { pendingToken: null, pendingTimer: null });
     }
   }, Math.max(1, Number(s.delaySec || 10)) * 1000);
@@ -1377,7 +1513,7 @@ async function renderHome(chatId, userId, messageId = null) {
 }
 
 async function renderQuickStart(chatId, userId, messageId) {
-  setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
+  setSession(userId, { awaitingInput: true, awaitingTransformInput: false, pendingClarifyText: "" });
   return editMessageText(chatId, messageId, buildQuickStartText(), {
     parse_mode: "HTML",
     reply_markup: quickReplyKeyboard(userId),
@@ -1610,7 +1746,7 @@ async function handleCallback(query) {
         }
       );
     }
-    return sendDraftWithDelay({ chatId, userId, incomingText: s.lastIncomingText });
+    return handleDraftRequest({ chatId, userId, incomingText: s.lastIncomingText });
   }
 
   if (data === "group_no_need") {
@@ -1639,7 +1775,7 @@ async function handleCallback(query) {
   if (data === "quick_reply_start") return renderQuickStart(chatId, userId, messageId);
   if (data === "style_text_start") return renderStyleTool(chatId, userId, messageId);
   if (data === "quick_input") {
-    setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
+    setSession(userId, { awaitingInput: true, awaitingTransformInput: false, pendingClarifyText: "" });
     return sendMessage(
       chatId,
       "✍️ <b>Ввести текст</b>\n\nПришли одно сообщение, на которое нужно подготовить ответ.",
@@ -1648,6 +1784,24 @@ async function handleCallback(query) {
         reply_markup: {
           inline_keyboard: [
             [{ text: "⬅ Назад", callback_data: "quick_reply_start" }],
+            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
+          ],
+        },
+      }
+    );
+  }
+
+  if (data === "quick_add_details") {
+    setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
+    return sendMessage(
+      chatId,
+      "🧩 <b>Добавь детали к текущему сообщению</b>\n\n" +
+        "Напиши, что важно учесть: сроки, сумма, условия, желаемый тон.",
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "⚡ Сгенерировать как есть", callback_data: "quick_force_generate" }],
             [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
           ],
         },
@@ -1679,7 +1833,18 @@ async function handleCallback(query) {
         reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "quick_input" }]] },
       });
     }
-    return sendDraftWithDelay({ chatId, userId, incomingText: s.lastIncomingText });
+    return handleDraftRequest({ chatId, userId, incomingText: s.lastIncomingText });
+  }
+
+  if (data === "quick_force_generate") {
+    const s = getSession(userId);
+    const src = String(s.pendingClarifyText || s.lastIncomingText || "").trim();
+    if (!src) {
+      return sendMessage(chatId, "Не нашёл текст для генерации. Нажми «✍️ Ввести текст».", {
+        reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "quick_input" }]] },
+      });
+    }
+    return handleDraftRequest({ chatId, userId, incomingText: src, force: true });
   }
 
   if (data === "quick_copy") {
@@ -2062,7 +2227,11 @@ async function handleMessage(message) {
 
   const s = getSession(userId);
   if (s.awaitingInput) {
-    await sendDraftWithDelay({ chatId, userId, incomingText: text });
+    const base = String(s.pendingClarifyText || "").trim();
+    const incomingText = base
+      ? `${base}\n\nДополнительные детали пользователя:\n${text}`
+      : text;
+    await handleDraftRequest({ chatId, userId, incomingText });
     return;
   }
   if (s.awaitingTransformInput) {
