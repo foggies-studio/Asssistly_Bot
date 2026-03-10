@@ -639,6 +639,27 @@ async function tg(method, payload) {
   return resp.data.result;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stripHtmlTags(text = "") {
+  return String(text || "").replace(/<[^>]*>/g, "");
+}
+
+function isTelegramRetryableError(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  const status = Number(err?.response?.status || 0);
+  if (status >= 500) return true;
+  if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("socket hang up")) return true;
+  return false;
+}
+
+function isTelegramParseModeError(err) {
+  const desc = String(err?.response?.data?.description || err?.message || "").toLowerCase();
+  return desc.includes("can't parse entities") || desc.includes("parse entities");
+}
+
 async function ensureWebhook() {
   if (!PUBLIC_URL) {
     console.log("PUBLIC_URL is not set, webhook auto-setup skipped");
@@ -663,7 +684,35 @@ async function ensureWebhook() {
 async function sendMessage(chatId, text, extra = {}) {
   // Бот ничего не пишет в группы/каналы.
   if (isGroupChatId(chatId)) return null;
-  return tg("sendMessage", { chat_id: chatId, text, ...extra });
+
+  const basePayload = { chat_id: chatId, text, ...extra };
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await tg("sendMessage", basePayload);
+    } catch (err) {
+      lastErr = err;
+
+      if (basePayload.parse_mode && isTelegramParseModeError(err)) {
+        try {
+          const fallbackPayload = { ...basePayload, text: stripHtmlTags(text) };
+          delete fallbackPayload.parse_mode;
+          return await tg("sendMessage", fallbackPayload);
+        } catch (fallbackErr) {
+          lastErr = fallbackErr;
+        }
+      }
+
+      if (attempt < 2 && isTelegramRetryableError(err)) {
+        await sleep(400);
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw lastErr;
 }
 
 async function editMessageText(chatId, messageId, text, extra = {}) {
@@ -1382,9 +1431,13 @@ async function sendDraftWithDelay({ chatId, userId, incomingText }) {
   const s = getSession(userId);
   cancelPending(userId);
 
-  await sendMessage(chatId, `⏳ Думаю над ответом...\nПришлю вариант через ${s.delaySec} сек.`, {
-    parse_mode: "HTML",
-  });
+  try {
+    await sendMessage(chatId, `⏳ Думаю над ответом...\nПришлю вариант через ${s.delaySec} сек.`, {
+      parse_mode: "HTML",
+    });
+  } catch (e) {
+    console.error("thinking message error:", e?.message || e);
+  }
 
   const token = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   setSession(userId, { pendingToken: token, lastIncomingText: incomingText, awaitingInput: false });
