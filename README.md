@@ -81,30 +81,6 @@
 - `/onboarding` — пройти онбординг заново
 - `/admin` — админ-панель (только для `ADMIN_IDS`)
 
-## Конфиг `.env`
-
-Пример:
-
-```env
-ADMIN_IDS=1441173568
-
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_WEBHOOK_SECRET=super-secret
-TELEGRAM_MODE=polling
-PUBLIC_URL=https://your-domain-or-tunnel
-BOT_USERNAME=Assistly_bot
-
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4o-mini
-
-DATABASE_URL="file:./dev.db"
-PORT=4010
-
-YOOKASSA_SHOP_ID=...
-YOOKASSA_SECRET_KEY=...
-YOOKASSA_WEBHOOK_SECRET=super-secret
-```
-
 ### Важные переменные
 
 - `TELEGRAM_MODE`
